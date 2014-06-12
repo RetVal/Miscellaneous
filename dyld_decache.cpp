@@ -61,17 +61,17 @@
 // g++ -o dyld_decache -O3 -Wall -Wextra -std=c++98 /usr/local/lib/libboost_filesystem-mt.a /usr/local/lib/libboost_system-mt.a dyld_decache.cpp DataFile.cpp
 
 #include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <cstdio>
 #include <stdint.h>
 #include <getopt.h>
 #include "DataFile.h"
 #include <string>
 #include <vector>
-#define BOOST_FILESYSTEM_VERSION 3
-#include <boost/filesystem.hpp>
+#include <algorithm>
 #include <utility>
-#include <boost/unordered_map.hpp>
-#include <boost/foreach.hpp>
+#include <unordered_map>
 
 struct dyld_cache_header {
 	char		magic[16];
@@ -390,12 +390,21 @@ static long write_uleb128(FILE* f, unsigned u) {
     return byte_count;
 }
 
-static boost::filesystem::path remove_all_extensions(const char* the_path) {
-    boost::filesystem::path retval (the_path);
-    do {
-        retval = retval.stem();
-    } while (!retval.extension().empty());
-    return retval;
+static void create_directories(size_t base_len, const std::string& path) {
+    for (size_t i = base_len; i != std::string::npos; i = path.find('/', i + 1)) {
+        if (mkdir(path.substr(0, i).c_str(), 0755) == -1 && errno != EEXIST)
+            perror("mkdir");
+    }
+}
+
+static std::string remove_all_extensions(const char* the_path) {
+    std::string path (the_path);
+    size_t start = path.rfind('/');
+    if (start == std::string::npos)
+        start = 0;
+    else
+        start++;
+    return path.substr(start, path.find('.', start));
 }
 
 
@@ -417,7 +426,7 @@ class ExtraStringRepository {
         std::vector<uint32_t> override_addresses;
     };
 
-    boost::unordered_map<const char*, int> _indices;
+    std::unordered_map<const char*, int> _indices;
     std::vector<Entry> _entries;
     size_t _total_size;
 
@@ -435,7 +444,7 @@ public:
     // Insert a piece of external data referred from 'override_address' to the
     //  repository.
     void insert(const char* string, size_t size, uint32_t override_address) {
-        boost::unordered_map<const char*, int>::const_iterator it = _indices.find(string);
+        std::unordered_map<const char*, int>::const_iterator it = _indices.find(string);
         if (it != _indices.end()) {
             _entries[it->second].override_addresses.push_back(override_address);
         } else {
@@ -457,7 +466,7 @@ public:
     // Iterate over all external data in this repository.
     template <typename Object>
     void foreach_entry(const Object* self, void (Object::*action)(const char* string, size_t size, uint32_t new_address, const std::vector<uint32_t>& override_addresses) const) const {
-        BOOST_FOREACH(const Entry& e, _entries) {
+        for(const Entry& e : _entries) {
             (self->*action)(e.string, e.size, e.new_address, e.override_addresses);
         }
     }
@@ -482,7 +491,7 @@ class ExtraBindRepository {
         std::vector<std::pair<int, uint32_t> > replace_offsets;
     };
     
-    boost::unordered_map<uint32_t, Entry> _entries;
+    std::unordered_map<uint32_t, Entry> _entries;
     
 public:
     bool contains(uint32_t target_address) const {
@@ -491,7 +500,7 @@ public:
     
     template <typename Object>
     void insert(uint32_t target_address, std::pair<int, uint32_t> replace_offset, const Object* self, void (Object::*addr_info_getter)(uint32_t addr, std::string* p_symname, int* p_libord) const) {
-        boost::unordered_map<uint32_t, Entry>::iterator it = _entries.find(target_address);
+        std::unordered_map<uint32_t, Entry>::iterator it = _entries.find(target_address);
         if (it != _entries.end()) {
             it->second.replace_offsets.push_back(replace_offset);
         } else {
@@ -503,13 +512,13 @@ public:
     }
     
     long optimize_and_write(FILE* f) {
-        typedef boost::unordered_map<uint32_t, Entry>::value_type V;
-        typedef boost::unordered_map<int, std::vector<const Entry*> > M;
+        typedef std::unordered_map<uint32_t, Entry>::value_type V;
+        typedef std::unordered_map<int, std::vector<const Entry*> > M;
         typedef std::pair<int, uint32_t> P;
         
         M entries_by_libord;
         
-        BOOST_FOREACH(V& pair, _entries) {
+        for(V& pair : _entries) {
             Entry& entry = pair.second;
             std::sort(entry.replace_offsets.begin(), entry.replace_offsets.end());
             entries_by_libord[entry.libord].push_back(&entry);
@@ -518,7 +527,7 @@ public:
         fputc(BIND_OPCODE_SET_TYPE_IMM | 1, f);
         
         long size = 1;
-        BOOST_FOREACH(const M::value_type& pair, entries_by_libord) {
+        for(const M::value_type& pair : entries_by_libord) {
             int libord = pair.first;
             if (libord < 0x10) {
                 unsigned char imm = libord & BIND_IMMEDIATE_MASK;
@@ -530,7 +539,7 @@ public:
                 size += 1 + write_uleb128(f, libord);
             }
             
-            BOOST_FOREACH(const Entry* entry, pair.second) {
+            for(const Entry* entry : pair.second) {
                 size_t string_len = entry->symname.size();
                 size += string_len + 2;
                 fputc(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, f);
@@ -538,7 +547,7 @@ public:
                 
                 int segnum = -1;
                 uint32_t last_offset = 0;
-                BOOST_FOREACH(P offset, entry->replace_offsets) {
+                for(P offset : entry->replace_offsets) {
                     if (offset.first != segnum) {
                         segnum = offset.first;
                         last_offset = offset.second + 4;
@@ -577,9 +586,9 @@ protected:
     uint32_t _image_vmaddr;
     
 private:
-    boost::unordered_map<std::string, int> _libords;
+    std::unordered_map<std::string, int> _libords;
     int _cur_libord;
-    boost::unordered_map<uint32_t, std::string> _exports;
+    std::unordered_map<uint32_t, std::string> _exports;
 
 protected:
     template <typename T>
@@ -597,7 +606,7 @@ protected:
     // Convert VM address to file offset of the decached file _before_ inserting
     //  the extra sections.
     long from_vmaddr(uint32_t vmaddr) const {
-        BOOST_FOREACH(const segment_command* segcmd, _segments) {
+        for(const segment_command* segcmd : _segments) {
             if (segcmd->vmaddr <= vmaddr && vmaddr < segcmd->vmaddr + segcmd->vmsize)
                 return vmaddr - segcmd->vmaddr + segcmd->fileoff;
         }
@@ -611,7 +620,7 @@ public:
     // Checks if the VM address is included in the decached file _before_
     //  inserting the extra sections.
     bool contains_address(uint32_t vmaddr) const {
-        BOOST_FOREACH(const segment_command* segcmd, _segments) {
+        for(const segment_command* segcmd : _segments) {
             if (segcmd->vmaddr <= vmaddr && vmaddr < segcmd->vmaddr + segcmd->vmsize)
                 return true;
         }
@@ -630,7 +639,7 @@ public:
     const mach_header* header() const { return _header; }
     
     int libord_with_name(const char* libname) const {
-        boost::unordered_map<std::string, int>::const_iterator cit = _libords.find(libname); 
+        std::unordered_map<std::string, int>::const_iterator cit = _libords.find(libname); 
         if (cit == _libords.end())
             return 0;
         else
@@ -638,7 +647,7 @@ public:
     }
     
     std::string exported_symbol(uint32_t vmaddr) const {
-        boost::unordered_map<uint32_t, std::string>::const_iterator cit = _exports.find(vmaddr);
+        std::unordered_map<uint32_t, std::string>::const_iterator cit = _exports.find(vmaddr);
         if (cit != _exports.end())
             return cit->second;
         else
@@ -699,8 +708,8 @@ private:
     ExtraBindRepository _extra_bind;
 
 private:
-    void open_file(const boost::filesystem::path& filename) {
-        boost::filesystem::create_directories(filename.parent_path());
+    void open_file(size_t folder_len, const std::string& filename) {
+        create_directories(folder_len, filename);
         _f = fopen(filename.c_str(), "wb");
         if (!_f) {
             perror("Error");
@@ -727,7 +736,8 @@ private:
         if (fileoff == 0)
             return;
 
-        BOOST_REVERSE_FOREACH(const FileoffFixup& fixup, _fixups) {
+        for(auto it = _fixups.rbegin(); it != _fixups.rend(); ++it) {
+            const FileoffFixup& fixup = *it;
             if (fixup.sourceBegin <= fileoff && fileoff < fixup.sourceEnd) {
                 fileoff -= fixup.negDelta;
                 return;
@@ -886,7 +896,7 @@ private:
     // Get the segment number and offset from that segment given a VM address.
     std::pair<int, uint32_t> segnum_and_offset(uint32_t vmaddr) const {
         int i = 0;
-        BOOST_FOREACH(const segment_command* segcmd, _segments) {
+        for(const segment_command* segcmd : _segments) {
             if (segcmd->vmaddr <= vmaddr && vmaddr < segcmd->vmaddr + segcmd->vmsize)
                 return std::make_pair(i, vmaddr - segcmd->vmaddr);
             ++ i;
@@ -902,7 +912,7 @@ private:
     void add_extlink_to(uint32_t vmaddr, uint32_t override_vmaddr);
 
     void patch_objc_sects_callback(const char*, size_t, uint32_t new_address, const std::vector<uint32_t>& override_addresses) const {
-        BOOST_FOREACH(uint32_t vmaddr, override_addresses) {
+        for(uint32_t vmaddr : override_addresses) {
             long actual_offset = this->from_new_vmaddr(vmaddr);
             fseek(_f, actual_offset, SEEK_SET);
             fwrite(&new_address, 4, 1, _f);
@@ -923,7 +933,7 @@ private:
     }
 
 public:
-    DecachingFile(const boost::filesystem::path& filename, const mach_header* header, const ProgramContext* context) :
+    DecachingFile(size_t folder_len, const std::string& filename, const mach_header* header, const ProgramContext* context) :
         MachOFile(header, context), _imageinfo_address(0),
         _extra_text("__TEXT", "__objc_extratxt", 2, 0),
         _extra_data("__DATA", "__objc_extradat", 0, 2)
@@ -936,21 +946,21 @@ public:
         }
         memset(&_new_linkedit_offsets, 0, sizeof(_new_linkedit_offsets));
 
-        this->open_file(filename);
+        this->open_file(folder_len, filename);
         if (!_f)
             return;
 
         // phase 1
-        BOOST_FOREACH(const segment_command* segcmd, _segments) {
+        for(const segment_command* segcmd : _segments) {
             ExtraStringRepository* repo = this->repo_for_segname(segcmd->segname);
             if (repo)
                 repo->set_section_vmaddr(segcmd->vmaddr + segcmd->vmsize);
         }
-        BOOST_FOREACH(const segment_command* segcmd, _segments)
+        for(const segment_command* segcmd : _segments)
             this->prepare_objc_extrastr(segcmd);
 
         // phase 2
-        BOOST_FOREACH(const segment_command* segcmd, _segments)
+        for(const segment_command* segcmd : _segments)
             this->write_segment_content(segcmd);
 
         // phase 3
@@ -983,8 +993,8 @@ class ProgramContext {
     char* _filename;
     DataFile* _f;
     bool _printmode;
-    std::vector<boost::filesystem::path> _namefilters;
-    boost::unordered_map<const mach_header*, boost::filesystem::path> _already_dumped;
+    std::vector<std::string> _namefilters;
+    std::unordered_map<const mach_header*, std::string> _already_dumped;
 
     const dyld_cache_header* _header;
     const shared_file_mapping_np* _mapping;
@@ -1069,7 +1079,7 @@ private:
         }
     }
     
-    void process_export_trie_node(off_t start, off_t cur, off_t end, const std::string& prefix, uint32_t bias, boost::unordered_map<uint32_t, std::string>& exports) const {
+    void process_export_trie_node(off_t start, off_t cur, off_t end, const std::string& prefix, uint32_t bias, std::unordered_map<uint32_t, std::string>& exports) const {
     	if (cur < end) {
     		_f->seek(cur);
     		unsigned char term_size = static_cast<unsigned char>(_f->read_char());
@@ -1092,7 +1102,7 @@ private:
     }
     
 public:
-    void fill_export(off_t start, off_t end, uint32_t bias, boost::unordered_map<uint32_t, std::string>& exports) const {
+    void fill_export(off_t start, off_t end, uint32_t bias, std::unordered_map<uint32_t, std::string>& exports) const {
         process_export_trie_node(start, start, end, "", bias, exports);
     }
 
@@ -1128,7 +1138,7 @@ public:
     
     uint32_t image_containing_address(uint32_t vmaddr, std::string* symname = NULL) const {
         uint32_t i = 0;
-        BOOST_FOREACH(const MachOFile& mo, _macho_files) {
+        for(const MachOFile& mo : _macho_files) {
             if (mo.contains_address(vmaddr)) {
                 if (symname)
                     *symname = mo.exported_symbol(vmaddr);
@@ -1150,8 +1160,8 @@ public:
         if (_namefilters.empty())
             return false;
             
-        boost::filesystem::path stem = remove_all_extensions(path);
-        BOOST_FOREACH(const boost::filesystem::path& filt, _namefilters) {
+        std::string stem = remove_all_extensions(path);
+        for(const std::string& filt : _namefilters) {
             if (stem == filt)
                 return false;
         }
@@ -1162,37 +1172,33 @@ public:
     // Decache the file of the specified index. If the file is already decached
     //  under a different name, create a symbolic link to it.
     void save_complete_image(uint32_t image_index) {
-        boost::filesystem::path filename (_folder);
+        std::string filename (_folder);
         const char* path = this->path_of_image(image_index);
-        filename /= path;
+        filename += '/'; filename += path;
+        size_t folder_len = strlen(_folder); 
 
         const mach_header* header = this->mach_header_of_image(image_index);
-        boost::unordered_map<const mach_header*, boost::filesystem::path>::const_iterator cit = _already_dumped.find(header);
+        std::unordered_map<const mach_header*, std::string>::const_iterator cit = _already_dumped.find(header);
 
         bool already_dumped = (cit != _already_dumped.end());
         printf("%3d/%d: %sing '%s'...\n", image_index, _header->imagesCount, already_dumped ? "Link" : "Dump", path);
 
         if (already_dumped) {
-            boost::system::error_code ec;
-            boost::filesystem::path src_path (path);
-            boost::filesystem::path target_path (".");
-            boost::filesystem::path::iterator it = src_path.begin();
-            ++ it;
-            ++ it;
-            for (; it != src_path.end(); ++ it) {
-                target_path /= "..";
-            }
-            target_path /= cit->second;
+            std::string src_path (path);
+            std::string target_path;
+            int cnt = std::count_if(src_path.begin(), src_path.end(), [](char x) { return x == '/'; }) - 1;
+            for (int i = 0; i < cnt; i++)
+                target_path += "../";
+            target_path += src_path.substr(src_path.rfind('/') + 1);
 
-            boost::filesystem::remove(filename);
-            boost::filesystem::create_directories(filename.parent_path());
-            boost::filesystem::create_symlink(target_path, filename, ec);
-            if (ec)
-                fprintf(stderr, "**** Failed: %s\n", ec.message().c_str());
+            unlink(filename.c_str());
+            create_directories(folder_len, filename);
+            if (symlink(target_path.c_str(), filename.c_str()) == -1)
+                perror("symlink failed");
 
         } else {
             _already_dumped.insert(std::make_pair(header, path));
-            DecachingFile df (filename, header, this);
+            DecachingFile df (folder_len, filename, header, this);
             if (!df.is_open())
                 perror("**** Failed");
         }
@@ -1302,7 +1308,7 @@ void DecachingFile::write_segment_content(const segment_command* segcmd) {
             filesize += repo->total_size();
         }
 
-        FileoffFixup fixup = {segcmd->fileoff, segcmd->fileoff + filesize, segcmd->fileoff - new_fileoff};
+        FileoffFixup fixup = {segcmd->fileoff, segcmd->fileoff + filesize, (int32_t) (segcmd->fileoff - new_fileoff)};
         _fixups.push_back(fixup);
     }
 }
